@@ -12,6 +12,22 @@ import LoopKit
 import UserNotifications
 import os.log
 import CoreBluetooth
+import UIKit
+
+var fakeInPlayPod = false
+var fakeIPhoneWithPossibleInPlayIssues = false
+
+// Returns a String of the form "iPhoneZ,Y" or "iPodX,Y"
+func getIPhoneType() -> String {
+    var systemInfo = utsname()
+    uname(&systemInfo)
+    let machineMirror = Mirror(reflecting: systemInfo.machine)
+    let identifier = machineMirror.children.reduce("") { identifier, element in
+        guard let value = element.value as? Int8, value != 0 else { return identifier }
+        return identifier + String(UnicodeScalar(UInt8(value)))
+    }
+    return identifier
+}
 
 public protocol PodStateObserver: AnyObject {
     func podStateDidUpdate(_ state: PodState?)
@@ -97,6 +113,27 @@ public class OmniBLEPumpManager: DeviceManager {
         self.podComms.delegate = self
         self.podComms.messageLogger = self
 
+        let nc = NotificationCenter.default
+        nc.addObserver(
+            self,
+            selector: #selector(appMovedToBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        nc.addObserver(
+            self,
+            selector: #selector(appMovedToForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+
+        // Needed setup if pod keep alives might be used
+        podKeepAliveSetup(refresh: refresh)
+    }
+
+    func refresh() {
+        // run in a separate thread?
+        self.getPodStatus() { _ in }
     }
 
     public required convenience init?(rawState: PumpManager.RawStateValue) {
@@ -272,6 +309,15 @@ public class OmniBLEPumpManager: DeviceManager {
         podStateObservers.forEach { (observer) in
             observer.podConnectionStateDidChange(isConnected: isConnected)
         }
+    }
+
+    private let backgroundTask = BackgroundTask()
+    @objc func appMovedToBackground() {
+        backgroundTask.startBackgroundTask(hasPod: state.podState != nil)
+    }
+
+    @objc func appMovedToForeground() {
+        backgroundTask.stopBackgroundTask()
     }
 
     private let pumpDelegate = WeakSynchronizedDelegate<PumpManagerDelegate>()
@@ -896,6 +942,14 @@ extension OmniBLEPumpManager {
                         // Have new podState, reset all the per pod pump manager state
                         self.resetPerPodPumpManagerState()
 
+                        if self.usingInPlayPod == true && self.iPhoneWithPossibleInPlayIssues {
+                            if Storage.shared.podKeepAlive.value == .disabled {
+                                // Enable the most conservative pod keep alive mode
+                                // that should work through the for pod setup process.
+                                self.log.debug("@@@ Enabling pod keep alives")
+                                Storage.shared.podKeepAlive.value = .whenOpen
+                            }
+                        }
                         // Calls completion
                         primeSession(result)
                     }
@@ -1071,7 +1125,9 @@ extension OmniBLEPumpManager {
     // MARK: - Pump Commands
 
     public func getPodStatus(completion: ((_ result: PumpManagerResult<StatusResponse>) -> Void)? = nil) {
-        guard state.hasActivePod else {
+        // Don't use guard state.hasActivePod here as it prevents getPodStatus from working
+        // after the pod has been paired, but before the pod setup process has been completed.
+        guard let podState = state.podState, podState.setupProgress.isPaired, podState.fault == nil else {
             completion?(.failure(PumpManagerError.configuration(OmniBLEPumpManagerError.noPodPaired)))
             return
         }
@@ -2479,6 +2535,35 @@ extension OmniBLEPumpManager: PumpManager {
                 completion(error)
             }
         }
+    }
+
+    // Running on an iPhone that might have BLE connect issues with newer InPlay BLE pods (or faking it)?
+    // In initial iPhone 17 testing, it appears that these issues are limited to just all iPhone 16's.
+    var iPhoneWithPossibleInPlayIssues: Bool {
+        if fakeIPhoneWithPossibleInPlayIssues {
+            return true
+        }
+
+        // Are we running on an iPhone 16 (Apple model # "iPhone17,N", sigh)?
+        // iPhone 17's (Apple model # 'iPhone18,N" sigh) appear to work with InPlay Pods!
+        let iPhoneType = getIPhoneType()
+        if iPhoneType.contains("iPhone17") {
+            return true
+        }
+
+        return false
+    }
+
+    // Using InPlay BLE pod (or if faking it)?
+    var usingInPlayPod: Bool? {
+
+        if let deviceBLEName = self.podComms.manager?.peripheral.name {
+            if deviceBLEName == "InPlay BLE" || fakeInPlayPod {
+                return true
+            }
+            return false
+        }
+        return nil // don't know -- maybe not paired yet
     }
 }
 
